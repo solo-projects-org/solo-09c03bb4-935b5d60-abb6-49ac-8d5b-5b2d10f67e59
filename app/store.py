@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -44,6 +45,9 @@ READ_CHUNK = 64 * 1024
 # Startup sweep only removes unreferenced artifacts older than this, which
 # protects a concurrent publisher that has renamed but not yet committed.
 RECOVERY_GRACE_SECONDS = 300
+# Consumer identifiers are caller-provided, so pin them to a bounded safe
+# charset before they ever reach a SQL parameter or a log line.
+CONSUMER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class StorageError(Exception):
@@ -107,6 +111,55 @@ class ArtifactCorrupt(StorageError):
         )
 
 
+class InvalidConsumer(StorageError):
+    def __init__(self, consumer_id: str):
+        super().__init__(
+            "invalid_consumer_id",
+            "consumer id must start with an alphanumeric character and contain "
+            f"only letters, digits, '_', '.', '-' (1-128 chars); got {consumer_id!r}",
+            400,
+        )
+
+
+class ConsumerNotFound(StorageError):
+    def __init__(self, consumer_id: str):
+        super().__init__(
+            "consumer_not_found",
+            f"consumer {consumer_id!r} has never claimed a version",
+            404,
+        )
+        self.consumer_id = consumer_id
+
+
+class AckWithoutClaim(StorageError):
+    def __init__(self, consumer_id: str, version_id: int):
+        super().__init__(
+            "ack_without_claim",
+            f"consumer {consumer_id!r} has no pending claim; version {version_id} "
+            "cannot be acknowledged before it is claimed",
+            409,
+        )
+
+
+class AckVersionMismatch(StorageError):
+    def __init__(self, consumer_id: str, expected: int, requested: int):
+        super().__init__(
+            "ack_version_mismatch",
+            f"consumer {consumer_id!r} must acknowledge version {expected} "
+            f"before any other; got version {requested}",
+            409,
+        )
+
+
+class AckDigestMismatch(StorageError):
+    def __init__(self, version_id: int):
+        super().__init__(
+            "ack_digest_mismatch",
+            f"submitted sha256 does not match the digest registered for version {version_id}",
+            409,
+        )
+
+
 @dataclass(frozen=True)
 class VersionInfo:
     version_id: int
@@ -118,6 +171,42 @@ class VersionInfo:
     trips_count: int
     stop_times_count: int
     artifact_name: str
+
+
+@dataclass(frozen=True)
+class ConsumerState:
+    consumer_id: str
+    next_version: int
+    last_claimed_version: Optional[int]
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    """One delivery slot for a consumer.
+
+    ``info`` is ``None`` only when every committed version has already been
+    acknowledged; otherwise it is the earliest not-yet-confirmed version and
+    ``replayed`` says whether the same slot was returned from a previous claim
+    (a crash/redelivery rather than a fresh one).
+    """
+
+    consumer_id: str
+    info: Optional[VersionInfo]
+    replayed: bool
+    next_version: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AckResult:
+    consumer_id: str
+    version_id: int
+    advanced: bool
+    next_version: int
+    last_claimed_version: Optional[int]
 
 
 SCHEMA = """
@@ -157,6 +246,22 @@ CREATE TABLE IF NOT EXISTS stop_times (
     PRIMARY KEY (version_id, trip_id, stop_sequence),
     FOREIGN KEY (version_id, stop_id) REFERENCES stops(version_id, stop_id),
     FOREIGN KEY (version_id, trip_id) REFERENCES trips(version_id, trip_id)
+);
+
+-- Per-consumer delivery cursor.  No foreign key on next_version / last_claimed
+-- on purpose: versions are append-only and never deleted, and keeping this
+-- table independent means delivery state always survives schema changes.
+-- next_version       : earliest version the consumer has not acknowledged.
+-- last_claimed_version: version handed out by the latest claim while it is
+--                       still unacknowledged; NULL once it is confirmed, which
+--                       makes a redelivery after a crash repeat the same row.
+CREATE TABLE IF NOT EXISTS consumer_progress (
+    consumer_id          TEXT    PRIMARY KEY,
+    next_version         INTEGER NOT NULL CHECK (next_version >= 1),
+    last_claimed_version INTEGER REFERENCES versions(version_id),
+    created_at           TEXT    NOT NULL,
+    updated_at           TEXT    NOT NULL,
+    CHECK (last_claimed_version IS NULL OR last_claimed_version = next_version)
 );
 """
 
@@ -378,6 +483,237 @@ class Store:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+
+    # -------------------------------------------------------------- delivery
+    @staticmethod
+    def _validate_consumer_id(consumer_id: str) -> str:
+        value = (consumer_id or "").strip()
+        if not CONSUMER_ID_RE.match(value):
+            raise InvalidConsumer(consumer_id)
+        return value
+
+    @staticmethod
+    def _consumer_state(row: sqlite3.Row) -> ConsumerState:
+        return ConsumerState(
+            consumer_id=row["consumer_id"],
+            next_version=int(row["next_version"]),
+            last_claimed_version=(
+                int(row["last_claimed_version"])
+                if row["last_claimed_version"] is not None
+                else None
+            ),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def get_consumer(self, consumer_id: str) -> ConsumerState:
+        consumer_id = self._validate_consumer_id(consumer_id)
+        with self.read_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM consumer_progress WHERE consumer_id = ?",
+                (consumer_id,),
+            ).fetchone()
+            if row is None:
+                raise ConsumerNotFound(consumer_id)
+            return self._consumer_state(row)
+
+    def list_consumers(self) -> List[ConsumerState]:
+        with self.read_transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM consumer_progress ORDER BY consumer_id"
+            ).fetchall()
+        return [self._consumer_state(row) for row in rows]
+
+    def claim_delivery(self, consumer_id: str) -> ClaimResult:
+        """Hand the consumer its earliest unacknowledged committed version.
+
+        Runs in a single ``BEGIN IMMEDIATE`` transaction so concurrent claims
+        from several processes serialise on SQLite's write lock; each consumer
+        row is only ever touched by its own transactions, and the version row
+        is read from the same committed snapshot as the cursor, so a claim can
+        never observe a half-published version or jump over an older one.
+
+        A consumer whose first claim arrives after versions 1..N exist starts
+        at version 1 (backfill).  Repeating a claim while the previous slot is
+        unacknowledged returns the same version, which is what makes the
+        protocol restart-safe.
+        """
+        consumer_id = self._validate_consumer_id(consumer_id)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            row = conn.execute(
+                "SELECT * FROM consumer_progress WHERE consumer_id = ?",
+                (consumer_id,),
+            ).fetchone()
+            if row is None:
+                # First contact: backfill starts from the oldest version.
+                conn.execute(
+                    "INSERT INTO consumer_progress (consumer_id, next_version, "
+                    "last_claimed_version, created_at, updated_at) "
+                    "VALUES (?, 1, NULL, ?, ?)",
+                    (consumer_id, now, now),
+                )
+                next_version = 1
+                last_claimed = None
+                created_at = now
+            else:
+                next_version = int(row["next_version"])
+                last_claimed = (
+                    int(row["last_claimed_version"])
+                    if row["last_claimed_version"] is not None
+                    else None
+                )
+                created_at = row["created_at"]
+
+            if last_claimed is not None:
+                # Pending slot: redeliver exactly the same version.  Nothing is
+                # mutated, so the claim stays idempotent across crashes.
+                target = last_claimed
+                replayed = True
+            else:
+                target = next_version
+                replayed = False
+
+            version_row = conn.execute(
+                "SELECT * FROM versions WHERE version_id = ?", (target,)
+            ).fetchone()
+            if version_row is None:
+                # Nothing committed at the frontier (yet).  Leave the cursor
+                # untouched; a later claim after a new publication picks it up.
+                result = ClaimResult(
+                    consumer_id=consumer_id,
+                    info=None,
+                    replayed=replayed,
+                    next_version=next_version,
+                    created_at=created_at,
+                    updated_at=now,
+                )
+                conn.execute("COMMIT")
+                return result
+
+            if not replayed:
+                conn.execute(
+                    "UPDATE consumer_progress SET last_claimed_version = ?, "
+                    "updated_at = ? WHERE consumer_id = ?",
+                    (target, now, consumer_id),
+                )
+            conn.execute("COMMIT")
+            return ClaimResult(
+                consumer_id=consumer_id,
+                info=self._version_info(version_row),
+                replayed=replayed,
+                next_version=next_version,
+                created_at=created_at,
+                updated_at=now,
+            )
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def acknowledge_delivery(
+        self, consumer_id: str, version_id: int, sha256: str
+    ) -> AckResult:
+        """Advance the cursor only after a verified, correctly-sequenced ack.
+
+        Three cases, decided inside one ``BEGIN IMMEDIATE`` transaction:
+
+        * The version is the consumer's currently pending claim.  The supplied
+          digest must equal the registered digest and the artifact on disk must
+          exist and hash to it; only then does ``next_version`` move forward and
+          the pending claim clear (``advanced=True``).
+        * The version was already confirmed earlier (a retried/lost-response
+          ack).  The registered digest must still match; the call succeeds
+          idempotently (``advanced=False``) and never moves the cursor, so a
+          duplicate can never skip the next version.
+        * Any other version is rejected: future versions would skip the
+          backlog, and an unclaimed frontier version must be claimed first.
+
+        ArtifactMissing (410) / ArtifactCorrupt (409) from on-disk verification
+        propagate to the API; after the artifact is repaired the same claim and
+        ack can be retried because the cursor has not moved.
+        """
+        consumer_id = self._validate_consumer_id(consumer_id)
+        if not isinstance(version_id, int) or version_id <= 0:
+            raise InvalidVersion(str(version_id))
+        digest = (sha256 or "").strip().lower()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            consumer = conn.execute(
+                "SELECT * FROM consumer_progress WHERE consumer_id = ?",
+                (consumer_id,),
+            ).fetchone()
+            if consumer is None:
+                raise ConsumerNotFound(consumer_id)
+
+            next_version = int(consumer["next_version"])
+            last_claimed = (
+                int(consumer["last_claimed_version"])
+                if consumer["last_claimed_version"] is not None
+                else None
+            )
+
+            version_row = conn.execute(
+                "SELECT * FROM versions WHERE version_id = ?", (version_id,)
+            ).fetchone()
+            if version_row is None:
+                raise VersionNotFound(str(version_id))
+            if digest != version_row["sha256"]:
+                raise AckDigestMismatch(version_id)
+
+            if last_claimed is not None and version_id == last_claimed:
+                # Normal path: confirm the pending claim.  Verify the actual
+                # artifact before moving the cursor; both happen in this one
+                # transaction, so a crash simply repeats the attempt.
+                info = self._version_info(version_row)
+                fd = self.open_verified_artifact(info)
+                os.close(fd)
+
+                now = utc_now()
+                conn.execute(
+                    "UPDATE consumer_progress SET next_version = ?, "
+                    "last_claimed_version = NULL, updated_at = ? "
+                    "WHERE consumer_id = ?",
+                    (version_id + 1, now, consumer_id),
+                )
+                conn.execute("COMMIT")
+                return AckResult(
+                    consumer_id=consumer_id,
+                    version_id=version_id,
+                    advanced=True,
+                    next_version=version_id + 1,
+                    last_claimed_version=None,
+                )
+
+            if version_id < next_version:
+                # Idempotent retry of an already-acknowledged version.  The
+                # cursor is untouched (and therefore cannot skip anything);
+                # only the registered digest is re-checked above.
+                conn.execute("COMMIT")
+                return AckResult(
+                    consumer_id=consumer_id,
+                    version_id=version_id,
+                    advanced=False,
+                    next_version=next_version,
+                    last_claimed_version=last_claimed,
+                )
+
+            # version_id >= next_version without a matching pending claim:
+            # either skipping ahead, or acknowledging something never claimed.
+            if last_claimed is not None:
+                raise AckVersionMismatch(consumer_id, last_claimed, version_id)
+            raise AckWithoutClaim(consumer_id, version_id)
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------ resolution
     def _resolve_version(self, conn: sqlite3.Connection, version: str) -> int:

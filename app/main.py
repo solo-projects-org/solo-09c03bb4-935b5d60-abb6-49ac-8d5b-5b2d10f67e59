@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from .gtfs_parse import FeedRejected, validate_archive
 from .store import (
+    ClaimResult,
     StorageError,
     Store,
     VersionInfo,
@@ -59,9 +60,13 @@ app = FastAPI(
         "发布时校验：站点/班次 ID 唯一、停站必须引用存在的站点和班次、"
         "每站必须有到站时刻、同班次站序不得重复、时刻随站序不得倒退；"
         "超过 24 点的 GTFS 时刻（如 25:10:00）是合法的。"
-        "校验失败会返回文件与行号，且不会改变任何已发布版本。"
+        "校验失败会返回文件与行号，且不会改变任何已发布版本。\n\n"
+        "增量交付 API（/api/v1/delivery/...）按消费者 ID 独立维护进度："
+        "领取最早未确认的已提交版本，返回版号、摘要与原包下载地址；"
+        "只有同时确认版号与摘要（且原包通过完整性校验）才推进游标，"
+        "未确认时反复领取仍返回同一版，崩溃后可重取，重复确认不会跳过下一版。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -118,6 +123,58 @@ class ValidationFailure(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Delivery (incremental consumer API) schemas
+# ---------------------------------------------------------------------------
+
+
+class AckRequest(BaseModel):
+    version_id: int = Field(gt=0, description="已领取并完成处理的版本号")
+    sha256: str = Field(
+        min_length=1,
+        description="领取时返回的该版本 ZIP 包 SHA-256 摘要，必须与登记摘要一致",
+    )
+
+
+class DeliveryEnvelope(BaseModel):
+    consumer_id: str = Field(description="消费者 ID，各消费者进度互不影响")
+    next_version: int = Field(description="该消费者最早未确认的版本号（交付游标）")
+    last_claimed_version: Optional[int] = Field(
+        description="当前已领取但尚未确认的版本号；无待确认领取时为 null"
+    )
+    replayed: bool = Field(
+        description="true 表示这是同一未确认版号的重复/崩溃后重取，而非新领取"
+    )
+    version: Optional[VersionSummary] = Field(
+        description="待交付版本摘要；所有已提交版本均确认完毕时为 null"
+    )
+    download_url: Optional[str] = Field(
+        description="该版本现有原包的下载地址（相对路径）；无待交付版本时为 null"
+    )
+
+
+class AckResponse(BaseModel):
+    consumer_id: str
+    version_id: int = Field(description="本次确认的版本号")
+    advanced: bool = Field(
+        description="true 表示游标本次实际推进；false 表示幂等的重复确认，未推进"
+    )
+    next_version: int = Field(description="确认后该消费者的下一个待交付版本号")
+    last_claimed_version: Optional[int]
+
+
+class ConsumerProgress(BaseModel):
+    consumer_id: str
+    next_version: int
+    last_claimed_version: Optional[int]
+    created_at: str
+    updated_at: str
+
+
+class ConsumerList(BaseModel):
+    consumers: List[ConsumerProgress]
 
 
 # ---------------------------------------------------------------------------
@@ -465,3 +522,128 @@ def healthz() -> dict:
             content={"status": "unhealthy", "error": str(exc)},
         )
     return {"status": "ok", "versions": len(versions), "current_version": current}
+
+
+# ---------------------------------------------------------------------------
+# Incremental delivery (per-consumer progress)
+# ---------------------------------------------------------------------------
+
+
+def _delivery_envelope(result: ClaimResult) -> DeliveryEnvelope:
+    summary = _summary(result.info) if result.info is not None else None
+    download_url = (
+        f"/api/v1/versions/{result.info.version_id}/download"
+        if result.info is not None
+        else None
+    )
+    # Whenever a version is returned it is the consumer's pending claim
+    # (fresh or replayed); when nothing is deliverable there is no pending slot.
+    pending = result.info.version_id if result.info is not None else None
+    return DeliveryEnvelope(
+        consumer_id=result.consumer_id,
+        next_version=result.next_version,
+        last_claimed_version=pending,
+        replayed=result.replayed,
+        version=summary,
+        download_url=download_url,
+    )
+
+
+@app.post(
+    "/api/v1/delivery/consumers/{consumer_id}/claim",
+    response_model=DeliveryEnvelope,
+    summary="领取该消费者最早未确认的已提交版本",
+    responses={
+        200: {
+            "description": "返回待交付版本；所有版本均已确认时 version 为 null",
+        },
+        400: {"model": ErrorResponse, "description": "消费者 ID 不合法"},
+    },
+)
+def claim_delivery(consumer_id: str) -> DeliveryEnvelope:
+    """按发布顺序交付下一个版本。
+
+    * 首次领取自动从最早的已提交版本开始（补齐既有版本）。
+    * 上一版尚未确认时反复领取，始终返回同一个版本（``replayed=true``），
+      因此消费者崩溃重启后可以原样重取。
+    * 所有已提交版本都确认完毕时返回 ``version=null``，新发布后再次领取即可。
+    * 每个消费者 ID 独立维护游标，互不串用；整个领取在一个 SQLite 写事务中
+      完成，多实例并发时不会交付半版或越过旧版。
+    """
+    return _delivery_envelope(get_store().claim_delivery(consumer_id))
+
+
+@app.post(
+    "/api/v1/delivery/consumers/{consumer_id}/ack",
+    response_model=AckResponse,
+    status_code=200,
+    summary="确认已领取版本（须同时提供版号与摘要）",
+    responses={
+        400: {"model": ErrorResponse, "description": "消费者 ID 或版号不合法"},
+        404: {"model": ErrorResponse, "description": "消费者尚未领取过任何版本"},
+        409: {
+            "model": ErrorResponse,
+            "description": "版号与待确认版不符、摘要不符，或原包校验失败",
+        },
+        410: {"model": ErrorResponse, "description": "原包缺失，修复后可重试"},
+    },
+)
+def acknowledge_delivery(consumer_id: str, payload: AckRequest) -> AckResponse:
+    """只有版号和摘要都匹配、且原包完整时才推进到下一版。
+
+    * 版号必须等于该消费者当前已领取未确认的版本，否则返回 409，游标不动。
+    * 摘要必须与发布时登记的 SHA-256 一致，否则返回 409，游标不动。
+    * 确认时会现场校验磁盘上的原包：缺失返回 410、摘要不符返回 409；
+      运维修复原包后用相同的领取/确认请求即可继续。
+    * 对已确认版本的重复确认幂等成功（``advanced=false``），绝不会跳过下一版。
+    """
+    result = get_store().acknowledge_delivery(
+        consumer_id=consumer_id,
+        version_id=payload.version_id,
+        sha256=payload.sha256,
+    )
+    return AckResponse(
+        consumer_id=result.consumer_id,
+        version_id=result.version_id,
+        advanced=result.advanced,
+        next_version=result.next_version,
+        last_claimed_version=result.last_claimed_version,
+    )
+
+
+@app.get(
+    "/api/v1/delivery/consumers",
+    response_model=ConsumerList,
+    summary="列出所有消费者的交付进度",
+)
+def list_consumers() -> ConsumerList:
+    states = get_store().list_consumers()
+    return ConsumerList(
+        consumers=[
+            ConsumerProgress(
+                consumer_id=state.consumer_id,
+                next_version=state.next_version,
+                last_claimed_version=state.last_claimed_version,
+                created_at=state.created_at,
+                updated_at=state.updated_at,
+            )
+            for state in states
+        ]
+    )
+
+
+@app.get(
+    "/api/v1/delivery/consumers/{consumer_id}",
+    response_model=ConsumerProgress,
+    summary="查看单个消费者的交付进度",
+    responses={404: {"model": ErrorResponse}},
+)
+def get_consumer_progress(consumer_id: str) -> ConsumerProgress:
+    state = get_store().get_consumer(consumer_id)
+    return ConsumerProgress(
+        consumer_id=state.consumer_id,
+        next_version=state.next_version,
+        last_claimed_version=state.last_claimed_version,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+    )
